@@ -23,11 +23,22 @@ from masakarimonitors.ha import masakari
 import masakarimonitors.hostmonitor.host_handler.driver as driver
 from masakarimonitors.hostmonitor.host_handler import hold_host_status
 from masakarimonitors.hostmonitor.host_handler import parse_cib_xml
+from masakarimonitors.hostmonitor.host_handler import parse_crmmon_xml
 from masakarimonitors.objects import event_constants as ec
 from masakarimonitors import utils
 
 LOG = oslo_logging.getLogger(__name__)
 CONF = masakarimonitors.conf.CONF
+
+class CibSchemaCompliantTag(dict):
+
+    def __init__(self, crmon_entry):
+        self['uname'] = crmon_entry.get('name')
+        if crmon_entry.get('online') == 'true':
+            state = 'online'
+        elif crmon_entry.get('online') == 'false':
+            state = 'offline'
+        self['crmd'] = state
 
 
 class HandleHost(driver.DriverBase):
@@ -40,6 +51,7 @@ class HandleHost(driver.DriverBase):
         super(HandleHost, self).__init__()
         self.my_hostname = socket.gethostname()
         self.xml_parser = parse_cib_xml.ParseCibXml()
+        self.crmmon_xml_parser = parse_crmmon_xml.ParseCrmMonXml()
         self.status_holder = hold_host_status.HostHoldStatus()
         self.notifier = masakari.SendNotification()
 
@@ -160,6 +172,21 @@ class HandleHost(driver.DriverBase):
 
             if err:
                 msg = ("cibadmin command output stderr: %s") % err
+                raise Exception(msg)
+
+        except Exception as e:
+            LOG.warning("Exception caught: %s", e)
+            return
+
+        return out
+
+    def _get_crmmon_xml(self):
+        try:
+            # Execute cibadmin command.
+            out, err = utils.execute('crm_mon', '-X', run_as_root=True)
+
+            if err:
+                msg = ("crmmon command output stderr: %s") % err
                 raise Exception(msg)
 
         except Exception as e:
@@ -298,6 +325,32 @@ class HandleHost(driver.DriverBase):
             # Update host status.
             self.status_holder.set_host_status(node_state_tag)
 
+
+    def _check_host_status_by_crm_mon(self):
+        crmmon_xml = self._get_crmmon_xml()
+        if crmmon_xml is None:
+            # crm_mon command failure.
+            return 1
+
+        # Set to the ParseCibXml object.
+        self.crmmon_xml_parser.set_crmmon_xml(crmmon_xml)
+
+        # Get node_state tag list.
+        node_state_tag_list = self.crmmon_xml_parser.get_node_state_tag_list()
+        if len(node_state_tag_list) == 0:
+            # If cib xml doesn't have node_state tag,
+            # it is an unexpected result.
+            raise Exception(
+                "Failed to get nodes tag from crm_mon xml.")
+
+        # Check if status changed.
+        node_state_tag_list = [ CibSchemaCompliantTag(n) for n in node_state_tag_list if n.get('type') == 'remote' ]
+        LOG.info('LY ent len = {}'.format(len(node_state_tag_list)))
+        self._check_if_status_changed(node_state_tag_list)
+
+        return 0
+
+
     def _check_host_status_by_cibadmin(self):
         # Get xml of cib info.
         cib_xml = self._get_cib_xml()
@@ -363,10 +416,16 @@ class HandleHost(driver.DriverBase):
                         continue
 
                 # Check the host status is online or offline by cibadmin.
-                if self._check_host_status_by_cibadmin() != 0:
-                    LOG.warning("hostmonitor skips monitoring hosts.")
-                    eventlet.greenthread.sleep(CONF.host.monitoring_interval)
-                    continue
+                if CONF.host.restrict_to_remotes:
+                    if self._check_host_status_by_crm_mon() != 0:
+                        LOG.warning("hostmonitor skips monitoring hosts.")
+                        eventlet.greenthread.sleep(CONF.host.monitoring_interval)
+                        continue
+                else:
+                    if self._check_host_status_by_cibadmin() != 0:
+                        LOG.warning("hostmonitor skips monitoring hosts.")
+                        eventlet.greenthread.sleep(CONF.host.monitoring_interval)
+                        continue
 
                 eventlet.greenthread.sleep(CONF.host.monitoring_interval)
 
